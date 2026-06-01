@@ -2,17 +2,14 @@
 """
 camera_node.py
 Hardware-triggered stereo capture (MJPG passthrough -> CompressedImage).
-Both OV9281 cameras share the XIAO GPIO5 trigger, which fires on every 4th IMU
-sample. The firmware flags that IMU sample, and imu_serial_node republishes its
-exact timestamp on /camera/trigger. This node stamps each stereo pair with the
-latest trigger timestamp -> true hardware-level camera-IMU alignment, no
-inference. Robust to camera drops: the IMU is reliable, so each event's trigger
-stamp always arrives (just before its frame); a dropped frame simply picks up
-the next correct trigger stamp.
+Each frame is stamped with the EXACT integer timestamp of the IMU sample that
+fired its trigger (from /camera/trigger), in integer nanoseconds (no float
+round-trip) so the stamp is byte-identical to the IMU sample's stamp.
+Frames that arrive before the first trigger (startup) are skipped, so no frame
+is ever emitted with an un-anchored wall-clock stamp.
 """
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Time
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Header
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -23,7 +20,7 @@ import threading
 
 Gst.init(None)
 
-TRIGGER_PERIOD = 0.040   # 25fps, used only as a fallback predictor
+TRIGGER_PERIOD_NS = 40_000_000   # 40ms, fallback predictor only
 
 class GstCamera:
     def __init__(self, device_id, width, height, callback):
@@ -75,15 +72,14 @@ class CameraNode(Node):
         self.pub_left  = self.create_publisher(CompressedImage, '/camera_left/compressed',  qos)
         self.pub_right = self.create_publisher(CompressedImage, '/camera_right/compressed', qos)
 
-        # Hardware trigger timestamps from the IMU node (flagged sample times)
         self.create_subscription(Header, '/camera/trigger', self.cb_trigger, 50)
-        self.latest_trigger     = None   # seconds, most recent trigger stamp
-        self.last_trigger_value = None   # last trigger value actually consumed
-        self.last_assigned      = None   # last stamp assigned to a frame
+        self.latest_trigger_ns   = None
+        self.last_trigger_val_ns = None
+        self.last_assigned_ns    = None
         self.trig_lock = threading.Lock()
 
-        self.shared_stamp = None
-        self.stamp_lock   = threading.Lock()
+        self.shared_ns  = None
+        self.stamp_lock = threading.Lock()
 
         self.cam_left  = GstCamera(left,  w, h, self.cb_left)
         self.cam_right = GstCamera(right, w, h, self.cb_right)
@@ -92,65 +88,68 @@ class CameraNode(Node):
         self.thread = threading.Thread(target=self.loop.run, daemon=True)
         self.thread.start()
 
-        self.n_left = self.n_right = self.predicted = 0
+        self.n_left = self.n_right = self.predicted = self.skipped = 0
         self.create_timer(5.0, self.stats)
 
         self.get_logger().info(
-            f'Camera node started (HW trigger, stamped from /camera/trigger)\n'
+            f'Camera node started (HW trigger, exact integer-ns stamps)\n'
             f'  Left:  /dev/video{left} -> /camera_left/compressed\n'
             f'  Right: /dev/video{right} -> /camera_right/compressed\n'
             f'  Resolution: {w}x{h}'
         )
 
     def cb_trigger(self, msg):
-        t = msg.stamp.sec + msg.stamp.nanosec * 1e-9
+        ns = msg.stamp.sec * 1_000_000_000 + msg.stamp.nanosec
         with self.trig_lock:
-            self.latest_trigger = t
+            self.latest_trigger_ns = ns
 
-    def next_stamp(self):
+    def next_stamp_ns(self):
         with self.trig_lock:
-            t = self.latest_trigger
-        if t is None:
-            # No trigger seen yet -> fall back to wall clock
-            return self.get_clock().now().nanoseconds * 1e-9
-        if t == self.last_trigger_value:
-            # Frame arrived before a fresh trigger msg -> predict to avoid a dup
+            ns = self.latest_trigger_ns
+        if ns is None:
+            return None  # no trigger yet -> caller skips this frame
+        if ns == self.last_trigger_val_ns:
             self.predicted += 1
-            stamp = (self.last_assigned + TRIGGER_PERIOD
-                     if self.last_assigned is not None else t)
+            out = (self.last_assigned_ns + TRIGGER_PERIOD_NS
+                   if self.last_assigned_ns is not None else ns)
         else:
-            stamp = t
-            self.last_trigger_value = t
-        self.last_assigned = stamp
-        return stamp
+            out = ns
+            self.last_trigger_val_ns = ns
+        self.last_assigned_ns = out
+        return out
 
-    def make_msg(self, data, stamp_sec):
+    def make_msg(self, data, ns):
         msg = CompressedImage()
-        msg.header.stamp    = Time(seconds=stamp_sec).to_msg()
-        msg.header.frame_id = 'camera_link'
-        msg.format          = 'jpeg'
-        msg.data            = data
+        msg.header.stamp.sec     = ns // 1_000_000_000
+        msg.header.stamp.nanosec = ns %  1_000_000_000
+        msg.header.frame_id      = 'camera_link'
+        msg.format               = 'jpeg'
+        msg.data                 = data
         return msg
 
     def cb_left(self, data):
-        stamp = self.next_stamp()
+        ns = self.next_stamp_ns()
+        if ns is None:
+            self.skipped += 1
+            return  # no trigger stamp yet; don't emit an un-anchored frame
         with self.stamp_lock:
-            self.shared_stamp = stamp
-        self.pub_left.publish(self.make_msg(data, stamp))
+            self.shared_ns = ns
+        self.pub_left.publish(self.make_msg(data, ns))
         self.n_left += 1
 
     def cb_right(self, data):
         with self.stamp_lock:
-            stamp = self.shared_stamp
-        if stamp is None:
-            stamp = self.get_clock().now().nanoseconds * 1e-9
-        self.pub_right.publish(self.make_msg(data, stamp))
+            ns = self.shared_ns
+        if ns is None:
+            self.skipped += 1
+            return  # left hasn't anchored a stamp yet
+        self.pub_right.publish(self.make_msg(data, ns))
         self.n_right += 1
 
     def stats(self):
         self.get_logger().info(
             f'Rates: left={self.n_left/5:.1f}Hz right={self.n_right/5:.1f}Hz '
-            f'predicted={self.predicted}'
+            f'predicted={self.predicted} skipped={self.skipped}'
         )
         self.n_left = self.n_right = 0
 

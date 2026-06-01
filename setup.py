@@ -16,11 +16,10 @@ setup(
     install_requires=['setuptools'],
     entry_points={
         'console_scripts': [
-            'camera_node         = igvc_camstuff.camera_node:main',
-            'camera_display_node = igvc_camstuff.camera_display_node:main',
-            'imu_serial_node     = igvc_camstuff.imu_serial_node:main',
-            'imu_monitor         = igvc_camstuff.imu_monitor:main',
-            'sync_test           = igvc_camstuff.sync_test:main',
+            'camera_node     = igvc_camstuff.camera_node:main',
+            'imu_serial_node = igvc_camstuff.imu_serial_node:main',
+            'imu_monitor     = igvc_camstuff.imu_monitor:main',
+            'sync_test       = igvc_camstuff.sync_test:main',
         ],
     },
 )
