@@ -4,46 +4,13 @@
 //         [quat w,x,y,z f32][gyro x,y,z f32][acc x,y,z f32]
 //         [diag_ori 3*f32][diag_gyro 3*f32][diag_acc 3*f32][crc16 u16] + COBS + 0x00.
 //
-// FIRMWARE DESIGN & CORNER CASES HANDLED:
-// ========================================
-// 1. MULTI-IMU SUPPORT: Probes BNO085 -> LSM6DSOX -> BMI088 at startup.
-//    No hardware auto-detect; if multiple devices present, first detected wins.
-//    Recommendation: Use only one IMU per board.
+// flags: bit0 = orientation_valid, bit1 = camera_triggered (this sample fired GPIO5)
 //
-// 2. COVARIANCE COMPUTATION: Dual mode:
-//    - Dynamic: Windowed accumulator (200 samples = 2 sec @ 100 Hz) for real-world noise estimation.
-//              Prevents numerical overflow in long runs via rolling buffer.
-//    - Static: Datasheet-derived per-sensor values; for controlled environments or robot_localization.
-//
-// 3. QUATERNION VALIDATION: If orientation norm < 1e-6, falls back to identity quaternion (1,0,0,0).
-//    Prevents division-by-zero and gracefully handles sensor anomalies.
-//
-// 4. FLOATING-POINT SAFETY: All sensor values clamped via fclampnan() which rejects NaN and ±Inf.
-//    Protects downstream processing from corrupted data.
-//
-// 5. TIMING & SEQUENCING:
-//    - Initial publish delayed to respect publish_dt_ms (prevents first packet at t=0).
-//    - Sequence number (u16) wraps at 65536 (~655 sec @ 100 Hz). Expected; not a bug.
-//
-// 6. CRC INJECTION: Controlled via compile flag ENABLE_CRC_INJECTION (default=off).
-//    Production MUST have this disabled. Inject_crc command is only active if compiled in.
-//
-// 7. WIRE.BEGIN() IDEMPOTENCE: Multiple calls are safe on most Arduino platforms.
-//    Each IMU driver calls Wire.begin() for robustness; main.cpp also calls it.
-//
-// 8. BUFFER SAFETY: Stack-allocated COBS buffer (256 bytes) verified safe for ~100 byte packets.
-//
-// KNOWN LIMITATIONS & FUTURE WORK:
-// - Camera trigger GPIO (mentioned by user): will require additional pin config + timer.
-// - Thermal monitoring: Temperature is read but unused. Consider adding shutdown logic.
-// - No I2C timeout protection: Bus hang will stall firmware. Library-dependent mitigation.
-// - Covariance reset: resetCovarianceAccumulators() exists but unreachable from CLI.
-//
-// DEVELOPMENT NOTES:
-// - Code changed in main.cpp loop() to snapshot sensor values BEFORE computeCovariances(),
-//   preventing driver-side filtering/covariance updates from mutating published values.
-// - BMI088 Z-axis gravity sign handling: Explicit axis mapping (ENU convention).
-// - BNO085 magnetometer calibration automatic at boot + runtime (FMC algorithm).
+// HARDWARE CAMERA-IMU SYNC:
+// The camera trigger fires on every 4th IMU sample (seq % 4 == 0 = 25 fps),
+// immediately after the IMU sample is read, so the global-shutter exposure and
+// that IMU sample coincide in hardware. The packet for that sample sets flags
+// bit1, telling the host exactly which IMU sample the camera frame belongs to.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -56,14 +23,8 @@
 #include "IMUCommon.h"
 #include "CameraManager.h"
 
-// Camera trigger configuration (edit here and recompile to change)
-// IMU publishes at 100 Hz (10 ms between packets)
-// For VIO, sync camera to IMU at integer multiples:
-//   40 ms  = 25 fps (every 4 IMU samples) - Best for VIO
-//   50 ms  = 20 fps (every 5 IMU samples)
-//   100 ms = 10 fps (every 10 IMU samples)
-// Pulse width: 20 microseconds (OV9281 requires >= 2 µs)
-static const uint32_t CAMERA_TRIGGER_RATE_MS = 40;  // 25 fps (40 ms = every 4 IMU samples)
+// Camera trigger fires every 4th IMU sample (100 Hz / 4 = 25 fps = 40 ms).
+static const uint8_t CAMERA_TRIGGER_EVERY_N = 4;   // every 4th sample = 25 fps
 
 static const uint8_t PKT_IMU_V1 = 0x31;
 
@@ -159,7 +120,7 @@ struct ImuPacketV1
     uint8_t type;
     uint16_t seq;
     uint8_t sensor_id;
-    uint8_t flags; // bit0: orientation_valid
+    uint8_t flags; // bit0: orientation_valid, bit1: camera_triggered
     uint32_t t_ms;
     float qw, qx, qy, qz;
     float gx, gy, gz; // rad/s
@@ -173,30 +134,23 @@ struct ImuPacketV1
 
 #if defined(__cplusplus) && (__cplusplus >= 201103L)
 static_assert(sizeof(ImuPacketV1) == (1 + 2 + 1 + 1 + 4 + 16 + 12 + 12 + 12 + 12 + 12 + 2), "Packet size mismatch");
-// COBS encoding worst-case: adds up to 1 byte per 254 bytes of payload. For a ~100 byte packet,
-// expect ~101 bytes encoded + 1 terminator = 102 bytes max. Stack buffer of 256 is safe.
 static_assert((sizeof(ImuPacketV1) * 2 < 256), "COBS buffer too small - increase buffer or reduce packet size");
 #endif
 
 static const uint32_t publish_hz = 100;
 static const uint32_t publish_dt_ms = 1000 / publish_hz;
 
-// CRC injection for testing: ONLY set true for deliberate fault injection testing.
-// Production deployments MUST have this false. Injecting corrupt CRCs will cause packet loss.
 #ifndef ENABLE_CRC_INJECTION
 #define ENABLE_CRC_INJECTION 0
 #endif
 static bool inject_crc = (ENABLE_CRC_INJECTION != 0);
 static bool send_test_once = false;
 
-// Set to true to use static (datasheet-derived) covariance values instead of computed ones
 static bool USE_STATIC_COVARIANCE = true;
 
-// Clamp NaN and ±Inf to zero for safety. Protects against sensor glitches or computation errors.
 static inline float fclampnan(float v) { return isfinite(v) ? v : 0.0f; }
 
-// Camera trigger manager (USB OV9281 cameras)
-// GPIO5 on RP2350, 0.5s default interval (2 Hz)
+// Camera trigger manager (USB OV9281 cameras), GPIO5 on RP2350.
 static CameraManager camera;
 
 static void process_commands(float ax, float ay, float az)
@@ -242,20 +196,19 @@ void setup()
     delay(50);
     Serial.println("IMU binary v1 ready (COBS+CRC16), 115200 baud");
     Serial.println("Commands: T=test, C=CRC toggle, D=accel");
-    Serial.println("Note: sequence number wraps at 65536 (after ~655 seconds at 100 Hz)");
+    Serial.println("Camera trigger: every 4th sample (25 fps), flags bit1 marks triggered sample");
     Wire.begin();
     begin_first_available();
 
-    // Apply static covariance mode if enabled
     if (imu && USE_STATIC_COVARIANCE)
     {
         imu->setStaticCovarianceMode(true);
         Serial.println("Static covariance mode: ENABLED");
     }
 
-    // Initialize camera trigger on GPIO5 (RP2350)
-    // Pulse: 20 µs, Rate set by CAMERA_TRIGGER_RATE_MS
-    camera.begin(5, 20, CAMERA_TRIGGER_RATE_MS);
+    // Initialize camera trigger pin on GPIO5 (RP2350), 20 us pulse.
+    // Interval arg unused now (we fire manually on every Nth sample), kept for pin setup.
+    camera.begin(5, 20, 40);
 }
 
 void loop()
@@ -265,14 +218,13 @@ void loop()
     static bool first_run = true;
 
     const uint32_t now_ms = millis();
-    
-    // On first call, initialize last_ms to now so we wait publish_dt_ms before first packet
+
     if (first_run)
     {
         last_ms = now_ms;
         first_run = false;
     }
-    
+
     if ((now_ms - last_ms) < publish_dt_ms)
     {
         process_commands(0.0f, 0.0f, 0.0f);
@@ -286,10 +238,13 @@ void loop()
         begin_first_available();
         if (!imu)
         {
-            delay(10); // Prevent busy-loop if no IMU detected
+            delay(10);
             return;
         }
     }
+
+    // Does THIS sample fire the camera trigger? (seq is this packet's number)
+    const bool trigger_this = (seq % CAMERA_TRIGGER_EVERY_N == 0);
 
     // 1) Read one fresh sample
     float raw_qw = 1.0f, raw_qx = 0.0f, raw_qy = 0.0f, raw_qz = 0.0f;
@@ -301,7 +256,13 @@ void loop()
     {
         imu->readSensorData();
 
-        // Snapshot values BEFORE computing covariances (critical for BMI088)
+        // Fire camera trigger IMMEDIATELY after reading this IMU sample, so the
+        // global-shutter exposure and this sample coincide in hardware.
+        if (trigger_this)
+        {
+            camera.sendTrigger();
+        }
+
         has_ori = imu->hasOrientation();
         if (has_ori)
         {
@@ -310,8 +271,6 @@ void loop()
             raw_qz = imu->getOrientationZ();
             raw_qw = imu->getOrientationW();
             float qn = sqrtf(raw_qw * raw_qw + raw_qx * raw_qx + raw_qy * raw_qy + raw_qz * raw_qz);
-            // Normalize quaternion to unit length. If norm is zero or very small,
-            // fallback to identity quaternion (w=1, x,y,z=0) for graceful degradation.
             const float QUAT_MIN_NORM = 1e-6f;
             if (qn > QUAT_MIN_NORM)
             {
@@ -322,7 +281,6 @@ void loop()
             }
             else
             {
-                // Degenerate case: use identity quaternion
                 raw_qw = 1.0f;
                 raw_qx = 0.0f;
                 raw_qy = 0.0f;
@@ -339,7 +297,6 @@ void loop()
         // 2) Only now compute covariances (do not touch the snapshot)
         imu->computeCovariances();
 
-        // Guard against NaNs
         raw_qw = fclampnan(raw_qw);
         raw_qx = fclampnan(raw_qx);
         raw_qy = fclampnan(raw_qy);
@@ -359,7 +316,7 @@ void loop()
     p.type = PKT_IMU_V1;
     p.seq = seq++;
     p.sensor_id = (uint8_t)detected;
-    p.flags = has_ori ? 0x01 : 0x00;
+    p.flags = (has_ori ? 0x01 : 0x00) | (trigger_this ? 0x02 : 0x00);
     p.t_ms = now_ms;
 
     p.qw = raw_qw;
@@ -377,7 +334,6 @@ void loop()
     const float *covA = (imu != nullptr) ? imu->getAccelCovMatrix() : nullptr;
     const float *covO = (imu != nullptr && has_ori) ? imu->getOrientationCovMatrix() : nullptr;
 
-    // Extract diagonal elements; default to zero if no covariance data available
     p.cov_gyr_x = covG ? fclampnan(covG[0]) : 0.0f;
     p.cov_gyr_y = covG ? fclampnan(covG[4]) : 0.0f;
     p.cov_gyr_z = covG ? fclampnan(covG[8]) : 0.0f;
@@ -393,7 +349,6 @@ void loop()
         p.cov_ori_z = fclampnan(covO[8]);
     }
 
-    // CRC (optional injection for recovery tests)
     const size_t payload_len_wo_crc = sizeof(ImuPacketV1) - sizeof(uint16_t);
     p.crc = crc16_ccitt(reinterpret_cast<const uint8_t *>(&p), payload_len_wo_crc);
     if (inject_crc && (p.seq % 100 == 0))
@@ -401,12 +356,8 @@ void loop()
         p.crc ^= 0xFFFF;
     }
 
-    // COBS encode + delimiter
     uint8_t enc[256];
     const size_t enc_len = cobs_encode(reinterpret_cast<const uint8_t *>(&p), sizeof(ImuPacketV1), enc);
     Serial.write(enc, enc_len);
     Serial.write((uint8_t)0x00);
-
-    // Check if cameras need to be triggered
-    camera.update();
 }
