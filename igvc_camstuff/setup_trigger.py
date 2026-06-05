@@ -1,60 +1,63 @@
 #!/usr/bin/env python3
 """
 setup_trigger.py
-Enables external hardware trigger snapshot mode on ArduCam OV9281 USB cameras.
-
-KEY FINDING: trigger mode is a STANDARD V4L2 control, not a UVC extension unit.
-ArduCam's 'low-brightness compensation' / 'exposure_auto_priority' maps to
-'exposure_dynamic_framerate' (control 0x009a0903) on kernel 6.8.
-Setting it to 1 ENABLES external trigger snapshot mode.
-
-Both cameras share the XIAO GPIO5 pulse, so they expose simultaneously =
-true hardware stereo sync.
-
-Wiring: OV9281 Pin F -> XIAO GPIO5, Pin G -> GND
+Enables external hardware trigger snapshot mode on the ArduCam OV9281 cameras.
+Auto-discovers them by V4L2 card name so it works regardless of /dev/videoN.
 """
 import subprocess
-import sys
+import glob
 
-CAMERAS    = ['/dev/video0', '/dev/video2']
-EXPOSURE   = 200   # units of 100us; 200 = 20ms (must be < 40ms for 25fps)
+CAMERA_NAME_MATCH = 'OV9281'
+EXPOSURE = 200   # units of 100us; 200 = 20ms (< 40ms trigger period)
 
-def set_ctrl(device, ctrl, value):
-    r = subprocess.run(
-        ['v4l2-ctl', '-d', device, f'--set-ctrl={ctrl}={value}'],
-        capture_output=True, text=True
-    )
+def card_name(dev):
+    try:
+        out = subprocess.run(['v4l2-ctl', '-d', dev, '--info'],
+                             capture_output=True, text=True, timeout=2).stdout
+        for line in out.splitlines():
+            if 'Card type' in line:
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return ''
+
+def is_capture(dev):
+    try:
+        out = subprocess.run(['v4l2-ctl', '-d', dev, '--list-formats'],
+                             capture_output=True, text=True, timeout=2).stdout
+        return 'MJPG' in out or 'YUYV' in out or 'Video Capture' in out
+    except Exception:
+        return False
+
+def discover():
+    devs = []
+    for dev in sorted(glob.glob('/dev/video*')):
+        if CAMERA_NAME_MATCH in card_name(dev) and is_capture(dev):
+            devs.append(dev)
+    return devs
+
+def set_ctrl(dev, ctrl, val):
+    r = subprocess.run(['v4l2-ctl', '-d', dev, f'--set-ctrl={ctrl}={val}'],
+                       capture_output=True, text=True)
     return r.returncode == 0
 
-def setup_camera(device):
-    print(f"Configuring {device} for external trigger...")
+def setup_camera(dev):
+    print(f'Configuring {dev} for external trigger...')
     ok = True
-    # 1) Manual exposure mode
-    ok &= set_ctrl(device, 'auto_exposure', 1)
-    # 2) Short fixed exposure (must be shorter than trigger period)
-    ok &= set_ctrl(device, 'exposure_time_absolute', EXPOSURE)
-    # 3) Enable external trigger snapshot mode (THE trigger switch)
-    ok &= set_ctrl(device, 'exposure_dynamic_framerate', 1)
-
-    if ok:
-        print(f"  ✓ {device} in external trigger mode (exposure={EXPOSURE*100}us)")
-    else:
-        print(f"  ✗ {device} setup had errors")
+    ok &= set_ctrl(dev, 'auto_exposure', 1)
+    ok &= set_ctrl(dev, 'exposure_time_absolute', EXPOSURE)
+    ok &= set_ctrl(dev, 'exposure_dynamic_framerate', 1)
+    print(f'  {"OK" if ok else "FAILED"}: {dev}')
     return ok
 
 if __name__ == '__main__':
-    print("ArduCam OV9281 External Trigger Setup")
-    print("=" * 40)
-    print("Wiring: Pin F -> GPIO5, Pin G -> GND")
-    print("Both cameras share the trigger = hardware stereo sync\n")
-
-    all_ok = True
-    for dev in CAMERAS:
-        all_ok &= setup_camera(dev)
-
-    print()
-    if all_ok:
-        print("✓ Both cameras armed. They will now capture only on GPIO5 pulses.")
+    print('ArduCam OV9281 External Trigger Setup (auto-discovery)')
+    print('=' * 50)
+    devs = discover()
+    if not devs:
+        print('No OV9281 cameras found! Check connections.')
     else:
-        print("⚠ Some cameras failed setup — check connections.")
-    print("Launch ROS2 nodes now.")
+        print(f'Found: {devs}')
+        for d in devs:
+            setup_camera(d)
+    print('Done.')

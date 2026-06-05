@@ -17,6 +17,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node     = igvc_camstuff.camera_node:main',
+            'decode_node     = igvc_camstuff.decode_node:main',
             'imu_serial_node = igvc_camstuff.imu_serial_node:main',
             'imu_monitor     = igvc_camstuff.imu_monitor:main',
             'sync_test       = igvc_camstuff.sync_test:main',
