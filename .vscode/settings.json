@@ -1,0 +1,17 @@
+{
+    "ROS2.distro": "humble",
+    "python.autoComplete.extraPaths": [
+        "/home/sean/ros2_ws/install/maddrone/lib/python3.10/site-packages",
+        "/home/sean/ros2_ws/install/lidarslam_msgs/local/lib/python3.10/dist-packages",
+        "/home/sean/ros2_ws/install/igvc_camstuff/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/sean/ros2_ws/install/maddrone/lib/python3.10/site-packages",
+        "/home/sean/ros2_ws/install/lidarslam_msgs/local/lib/python3.10/dist-packages",
+        "/home/sean/ros2_ws/install/igvc_camstuff/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

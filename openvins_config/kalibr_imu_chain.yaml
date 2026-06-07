@@ -1,10 +1,19 @@
 %YAML:1.0
+
 imu0:
+  model: "kalibr"
+  rostopic: /imu/data
+  update_rate: 100.0
+  accelerometer_noise_density: 1.86e-02
+  accelerometer_random_walk: 4.33e-03
+  gyroscope_noise_density: 1.87e-03
+  gyroscope_random_walk: 2.66e-04
   T_i_b:
     - [1.0, 0.0, 0.0, 0.0]
     - [0.0, 1.0, 0.0, 0.0]
     - [0.0, 0.0, 1.0, 0.0]
     - [0.0, 0.0, 0.0, 1.0]
+  time_offset: 0.0
   Tw:
     - [1.0, 0.0, 0.0]
     - [0.0, 1.0, 0.0]
@@ -25,11 +34,3 @@ imu0:
     - [0.0, 0.0, 0.0]
     - [0.0, 0.0, 0.0]
     - [0.0, 0.0, 0.0]
-  accelerometer_noise_density: 0.002
-  accelerometer_random_walk:   0.0003
-  gyroscope_noise_density:     0.0002
-  gyroscope_random_walk:       0.00002
-  model: kalibr
-  rostopic: /imu/data
-  time_offset: 0.0
-  update_rate: 100.0

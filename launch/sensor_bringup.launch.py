@@ -1,9 +1,11 @@
-from launch import LaunchDescription
-from launch.actions import ExecuteProcess, TimerAction, DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
-from launch.conditions import IfCondition
-from launch_ros.actions import Node
 import os
+
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+from launch import LaunchDescription
 
 home         = os.path.expanduser('~')
 scripts_path = os.path.join(home, 'ros2_ws/src/igvc_camstuff/igvc_camstuff')
@@ -20,6 +22,20 @@ def generate_launch_description():
         # Arm both cameras into external hardware-trigger mode
         ExecuteProcess(
             cmd=['python3', os.path.join(scripts_path, 'setup_trigger.py')],
+            output='screen'
+        ),
+
+        # Fix camera exposure: disable dynamic framerate, set manual low exposure
+        ExecuteProcess(
+            cmd=['v4l2-ctl', '-d', '/dev/video5',
+                 '-c', 'exposure_dynamic_framerate=0',
+                 '-c', 'exposure_time_absolute=100'],
+            output='screen'
+        ),
+        ExecuteProcess(
+            cmd=['v4l2-ctl', '-d', '/dev/video7',
+                 '-c', 'exposure_dynamic_framerate=0',
+                 '-c', 'exposure_time_absolute=100'],
             output='screen'
         ),
 
@@ -56,7 +72,5 @@ def generate_launch_description():
                  condition=IfCondition(LaunchConfiguration('rviz')),
                  arguments=['-d', rviz_config]),
         ]),
-
-        # imu_monitor disabled (was flooding the console).
 
     ])

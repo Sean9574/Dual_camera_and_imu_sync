@@ -1,0 +1,15 @@
+=== FISHEYE STEREO CALIBRATION RESULT ===
+mono RMS    L=0.7379px  R=0.7412px
+stereo RMS  0.8036px
+views used  monoL=51 monoR=53 stereo=49
+baseline    72.90 mm
+
+cam0 intrinsics [fx,fy,cx,cy]: 719.4519, 721.9364, 683.4017, 421.3023
+cam0 distortion [k1..k4]:      -0.080236, 0.142701, -0.276103, 0.177827
+cam1 intrinsics [fx,fy,cx,cy]: 714.1410, 717.1821, 656.7205, 404.0302
+cam1 distortion [k1..k4]:      -0.072817, 0.111663, -0.208721, 0.118739
+stereo R (cam0->cam1):
+[[ 0.99997677  0.00136191  0.00667903]
+ [-0.00132385  0.99998288 -0.00569975]
+ [-0.00668668  0.00569077  0.99996145]]
+stereo T (m): [-0.072856   -0.00021707  0.00245501]
